@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PokeTool</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 12px; }
+h1 { font-size: 1.4em; }
+h2 { font-size: 1.1em; margin-bottom: 8px; }
+.header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: #16213e; border-radius: 8px; margin-bottom: 12px; }
+.badge { padding: 3px 10px; border-radius: 12px; font-size: 0.8em; font-weight: bold; }
+.badge-off { background: #555; }
+.badge-conn { background: #2d6a4f; }
+.badge-trade { background: #e76f51; }
+.card { background: #16213e; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.mode-btns { display: flex; gap: 8px; margin-bottom: 8px; }
+.mode-btns button { flex: 1; padding: 8px; border: 2px solid #444; border-radius: 6px; background: #0f3460; color: #e0e0e0; font-size: 0.95em; cursor: pointer; }
+.mode-btns button.active { border-color: #e76f51; background: #e76f51; color: #fff; }
+.slot { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; border-bottom: 1px solid #1a1a2e; }
+.slot:last-child { border-bottom: none; }
+.slot-name { font-weight: bold; }
+.slot-info { font-size: 0.85em; color: #aaa; }
+.slot-empty { color: #555; font-style: italic; }
+.btn { padding: 5px 12px; border: none; border-radius: 5px; cursor: pointer; font-size: 0.85em; }
+.btn-del { background: #c0392b; color: #fff; }
+.btn-del:hover { background: #e74c3c; }
+.btn-confirm { background: #27ae60; color: #fff; padding: 8px 20px; font-size: 1em; }
+.btn-confirm:hover { background: #2ecc71; }
+.btn-decline { background: #c0392b; color: #fff; padding: 8px 20px; font-size: 1em; }
+.btn-decline:hover { background: #e74c3c; }
+.btn-confirm:disabled, .btn-decline:disabled { opacity: 0.4; cursor: default; }
+.trade-actions { display: flex; gap: 10px; margin-top: 8px; align-items: center; }
+.tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+.tabs button { padding: 5px 14px; border: 1px solid #444; border-radius: 5px 5px 0 0; background: #0f3460; color: #aaa; cursor: pointer; }
+.tabs button.active { background: #16213e; color: #fff; border-bottom-color: #16213e; }
+select { background: #0f3460; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; }
+label { font-size: 0.9em; }
+.opponent-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.opp-slot { background: #0f3460; border-radius: 6px; padding: 6px; text-align: center; font-size: 0.85em; }
+.opp-slot.selected { border: 2px solid #e76f51; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>PokeTool</h1>
+  <span id="statusBadge" class="badge badge-off">Disconnected</span>
+</div>
+
+<!-- Mode Toggle -->
+<div class="card">
+  <h2>Mode</h2>
+  <div class="mode-btns">
+    <button id="btnClone" onclick="setMode('clone')">Clone</button>
+    <button id="btnStorage" onclick="setMode('storage')">Storage</button>
+  </div>
+</div>
+
+<!-- Trade Panel -->
+<div id="tradePanel" class="card hidden">
+  <h2>Trade</h2>
+  <div style="margin-bottom:8px;font-size:0.9em;">
+    <span id="tradeGen"></span> &mdash; <span id="tradeState"></span>
+  </div>
+
+  <!-- Opponent Party -->
+  <div id="opponentParty" style="margin-bottom:10px;">
+    <div style="font-size:0.9em;margin-bottom:4px;color:#aaa;">Opponent's Party:</div>
+    <div id="oppGrid" class="opponent-grid"></div>
+  </div>
+
+  <!-- Offer Slot -->
+  <div style="margin-bottom:8px;">
+    <label>Offer slot: </label>
+    <select id="offerSlot" onchange="setOffer(this.value)">
+      <option value="0">0</option>
+      <option value="1">1</option>
+      <option value="2">2</option>
+      <option value="3">3</option>
+      <option value="4">4</option>
+      <option value="5">5</option>
+    </select>
+    &nbsp;
+    <label><input type="checkbox" id="autoConfirm" onchange="setAuto(this.checked)" checked> Auto-confirm</label>
+  </div>
+
+  <!-- Confirm/Decline -->
+  <div class="trade-actions">
+    <button id="btnConfirm" class="btn btn-confirm" onclick="tradeConfirm()" disabled>Confirm</button>
+    <button id="btnDecline" class="btn btn-decline" onclick="tradeDecline()" disabled>Decline</button>
+    <span id="tradeResult" style="font-size:0.9em;"></span>
+  </div>
+</div>
+
+<!-- Storage Panel -->
+<div class="card">
+  <h2>Storage</h2>
+  <div class="tabs">
+    <button id="tabGen1" class="active" onclick="switchTab('gen1')">Gen 1</button>
+    <button id="tabGen2" onclick="switchTab('gen2')">Gen 2</button>
+  </div>
+  <div id="storageSlots"></div>
+</div>
+
+<script>
+let currentTab = 'gen1';
+let lastStatus = {};
+
+function api(path, opts) {
+  return fetch(path, opts).then(r => r.json()).catch(() => null);
+}
+
+function setMode(mode) {
+  api('/api/mode', {method:'POST', body: JSON.stringify({mode})});
+}
+
+function setOffer(slot) {
+  api('/api/trade/offer', {method:'POST', body: JSON.stringify({slot: parseInt(slot)})});
+}
+
+function setAuto(auto) {
+  api('/api/trade/auto', {method:'POST', body: JSON.stringify({auto})});
+}
+
+function tradeConfirm() {
+  api('/api/trade/confirm', {method:'POST', body:'{}'});
+}
+
+function tradeDecline() {
+  api('/api/trade/decline', {method:'POST', body:'{}'});
+}
+
+function deleteSlot(gen, slot) {
+  api('/api/pokemon/' + gen + '/' + slot, {method:'DELETE'}).then(() => loadStorage());
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabGen1').className = tab === 'gen1' ? 'active' : '';
+  document.getElementById('tabGen2').className = tab === 'gen2' ? 'active' : '';
+  loadStorage();
+}
+
+function loadStorage() {
+  api('/api/pokemon/' + currentTab).then(slots => {
+    if (!slots) return;
+    let html = '';
+    slots.forEach(s => {
+      if (s.occupied) {
+        html += '<div class="slot"><div><span class="slot-name">' + s.speciesName + '</span> '
+          + '<span class="slot-info">Lv' + s.level + ' [' + (s.nickname || '') + ']</span></div>'
+          + '<button class="btn btn-del" onclick="deleteSlot(\'' + currentTab + '\',' + s.slot + ')">Del</button></div>';
+      } else {
+        html += '<div class="slot"><span class="slot-empty">Slot ' + s.slot + ' &mdash; Empty</span></div>';
+      }
+    });
+    document.getElementById('storageSlots').innerHTML = html;
+  });
+}
+
+function updateOpponent() {
+  api('/api/opponent').then(opp => {
+    if (!opp) return;
+    let html = '';
+    if (opp.length === 0) {
+      html = '<div style="color:#555;font-size:0.85em;">Waiting for party data...</div>';
+    }
+    opp.forEach(o => {
+      let sel = (lastStatus.tradePokemon === o.slot) ? ' selected' : '';
+      html += '<div class="opp-slot' + sel + '">'
+        + '<div class="slot-name">' + o.speciesName + '</div>'
+        + '<div class="slot-info">Lv' + o.level + '</div>'
+        + '<div class="slot-info">' + (o.nickname || '') + '</div></div>';
+    });
+    document.getElementById('oppGrid').innerHTML = html;
+  });
+}
+
+function poll() {
+  api('/api/status').then(s => {
+    if (!s) return;
+    lastStatus = s;
+
+    // Badge
+    let badge = document.getElementById('statusBadge');
+    if (s.conn === 'not_connected') {
+      badge.textContent = 'Disconnected';
+      badge.className = 'badge badge-off';
+    } else if (s.conn === 'trade_centre') {
+      badge.textContent = s.gen.toUpperCase() + ' Trade';
+      badge.className = 'badge badge-trade';
+    } else {
+      badge.textContent = 'Connected (' + s.gen + ')';
+      badge.className = 'badge badge-conn';
+    }
+
+    // Mode buttons
+    document.getElementById('btnClone').className = (s.mode === 'clone') ? 'active' : '';
+    document.getElementById('btnStorage').className = (s.mode === 'storage') ? 'active' : '';
+
+    // Trade panel visibility
+    let tp = document.getElementById('tradePanel');
+    if (s.conn === 'trade_centre') {
+      tp.classList.remove('hidden');
+      document.getElementById('tradeGen').textContent = s.gen.toUpperCase();
+      document.getElementById('tradeState').textContent = s.tc;
+
+      // Offer slot
+      document.getElementById('offerSlot').value = s.offerSlot;
+      document.getElementById('autoConfirm').checked = s.autoConfirm;
+
+      // Confirm/decline buttons
+      let isPending = (s.tc === 'trade_confirm' && !s.autoConfirm);
+      document.getElementById('btnConfirm').disabled = !isPending;
+      document.getElementById('btnDecline').disabled = !isPending;
+
+      // Update opponent
+      if (s.opponentCount > 0) updateOpponent();
+    } else {
+      tp.classList.add('hidden');
+    }
+  });
+}
+
+// Initial load
+loadStorage();
+setInterval(poll, 500);
+setInterval(loadStorage, 3000);
+</script>
+</body>
+</html>

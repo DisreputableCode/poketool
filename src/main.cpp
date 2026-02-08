@@ -3,6 +3,8 @@
 #include "link_cable.h"
 #include "led.h"
 #include "trade_data.h"
+#include "storage.h"
+#include "wifi_server.h"
 #include <string.h>
 
 // =============================================================================
@@ -43,22 +45,6 @@ static const char* connStateName(ConnectionState s) {
     return "?";
 }
 
-static const char* tcStateName(TradeCentreState s) {
-    switch (s) {
-        case TC_INIT:                return "INIT";
-        case TC_READY_TO_GO:         return "READY_TO_GO";
-        case TC_SEEN_FIRST_WAIT:     return "SEEN_FIRST_WAIT";
-        case TC_SENDING_RANDOM_DATA: return "SENDING_RANDOM_DATA";
-        case TC_WAITING_TO_SEND_DATA:return "WAIT_TO_SEND";
-        case TC_SENDING_DATA:        return "SENDING_DATA";
-        case TC_SENDING_PATCH_DATA:  return "SENDING_PATCH";
-        case TC_TRADE_PENDING:       return "TRADE_PENDING";
-        case TC_TRADE_CONFIRMATION:  return "TRADE_CONFIRM";
-        case TC_DONE:                return "DONE";
-    }
-    return "?";
-}
-
 // =============================================================================
 // Global State
 // =============================================================================
@@ -66,6 +52,9 @@ static const char* tcStateName(TradeCentreState s) {
 static ConnectionState connState = CONN_NOT_CONNECTED;
 static TradeCentreState tcState = TC_INIT;
 static Generation gen = GEN_UNKNOWN;
+
+// Shared context for web server
+static TradeContext ctx;
 
 // Data exchange buffers (sized for Gen 2 which is larger)
 static uint8_t sendBlock[MAX_PARTY_BLOCK_SIZE];
@@ -80,50 +69,82 @@ static int counter = 0;
 static int dataLength = 0;
 
 // Trade tracking
-static int tradePokemon = -1;       // Index of Pokemon selected by Game Boy (-1 = none)
-static bool haveReceivedPokemon = false; // Have we received a Pokemon from a previous trade?
+static int tradePokemon = -1;
 
-// Received Pokemon storage (single slot for clone mode)
-// Gen 1: 44 bytes struct + 11 OT name + 11 nickname = 66 bytes
-// Gen 2: 48 bytes struct + 11 OT name + 11 nickname = 70 bytes
-static uint8_t storedMon[GEN2_PARTY_STRUCT_SIZE];
-static uint8_t storedOT[NAME_LENGTH];
-static uint8_t storedNickname[NAME_LENGTH];
-static uint8_t storedSpeciesIndex = 0; // Species byte for partySpecies array
+// Storage mode: maps party position -> storage slot index
+static int partyToStorage[PARTY_LENGTH];
 
 // The current byte to send (set by handleByte, consumed by loop)
 static uint8_t outByte = 0x00;
 
 // =============================================================================
-// Prepare Trade Data
+// Sync State to TradeContext (for web server visibility)
 // =============================================================================
 
-// Build our party block and patch list for sending.
-// On first trade: default party. On subsequent: clone received Pokemon.
+static void syncContext() {
+    ctx.connState = (int)connState;
+    ctx.tcState = (int)tcState;
+    ctx.gen = (int)gen;
+    ctx.tradePokemon = tradePokemon;
+}
+
+// =============================================================================
+// Prepare Trade Data — Mode-aware party building
+// =============================================================================
+
 static void prepareTradeData() {
+    StoredPokemon* party = storage_getParty(gen);
+    TradeMode mode = (TradeMode)ctx.tradeMode;
+
     if (gen == GEN_1) {
         dataLength = GEN1_PARTY_BLOCK_SIZE - GEN1_PREAMBLE_SIZE; // 418
 
         Gen1PartyBlock* block = (Gen1PartyBlock*)sendBlock;
+        memset(block, 0, sizeof(Gen1PartyBlock));
+        memset(block->preamble, SERIAL_PREAMBLE_BYTE, GEN1_PREAMBLE_SIZE);
 
-        if (haveReceivedPokemon) {
-            // Clone mode: fill party with received Pokemon
-            memset(block, 0, sizeof(Gen1PartyBlock));
-            memset(block->preamble, SERIAL_PREAMBLE_BYTE, GEN1_PREAMBLE_SIZE);
-            memcpy(block->playerName, storedOT, NAME_LENGTH);
-            block->partyCount = PARTY_LENGTH;
-            for (int i = 0; i < PARTY_LENGTH; i++) {
-                block->partySpecies[i] = storedSpeciesIndex;
-                memcpy(&block->pokemon[i], storedMon, GEN1_PARTY_STRUCT_SIZE);
-                memcpy(block->otNames[i], storedOT, NAME_LENGTH);
-                memcpy(block->nicknames[i], storedNickname, NAME_LENGTH);
+        if (mode == TRADE_MODE_CLONE) {
+            // Clone mode: clone slot 0 into all 6 positions
+            if (party[0].occupied) {
+                memcpy(block->playerName, party[0].ot, NAME_LENGTH);
+                block->partyCount = PARTY_LENGTH;
+                for (int i = 0; i < PARTY_LENGTH; i++) {
+                    block->partySpecies[i] = party[0].speciesIndex;
+                    memcpy(&block->pokemon[i], party[0].monData, GEN1_PARTY_STRUCT_SIZE);
+                    memcpy(block->otNames[i], party[0].ot, NAME_LENGTH);
+                    memcpy(block->nicknames[i], party[0].nickname, NAME_LENGTH);
+                    partyToStorage[i] = 0;
+                }
+                block->partySpecies[PARTY_LENGTH] = 0xFF;
+            } else {
+                gen1_buildDefaultParty(block);
+                for (int i = 0; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
             }
-            block->partySpecies[PARTY_LENGTH] = 0xFF;
         } else {
-            gen1_buildDefaultParty(block);
+            // Storage mode: fill with occupied slots
+            int pos = 0;
+            for (int i = 0; i < PARTY_LENGTH && pos < PARTY_LENGTH; i++) {
+                if (party[i].occupied) {
+                    block->partySpecies[pos] = party[i].speciesIndex;
+                    memcpy(&block->pokemon[pos], party[i].monData, GEN1_PARTY_STRUCT_SIZE);
+                    memcpy(block->otNames[pos], party[i].ot, NAME_LENGTH);
+                    memcpy(block->nicknames[pos], party[i].nickname, NAME_LENGTH);
+                    partyToStorage[pos] = i;
+                    pos++;
+                }
+            }
+            if (pos == 0) {
+                gen1_buildDefaultParty(block);
+                for (int i = 0; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
+            } else {
+                // Use first occupied slot's OT as player name
+                memcpy(block->playerName, party[partyToStorage[0]].ot, NAME_LENGTH);
+                block->partyCount = pos;
+                block->partySpecies[pos] = 0xFF;
+                for (int i = pos; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
+            }
         }
 
-        // Build patch list on data portion (skip preamble)
         buildPatchList(sendBlock + GEN1_PREAMBLE_SIZE, dataLength,
                        sendPatch, PATCH_DATA_SPLIT);
 
@@ -131,37 +152,62 @@ static void prepareTradeData() {
         dataLength = GEN2_PARTY_BLOCK_SIZE - GEN2_PREAMBLE_SIZE; // 444
 
         Gen2PartyBlock* block = (Gen2PartyBlock*)sendBlock;
+        memset(block, 0, sizeof(Gen2PartyBlock));
+        memset(block->preamble, SERIAL_PREAMBLE_BYTE, GEN2_PREAMBLE_SIZE);
+        block->playerId[0] = 0x00;
+        block->playerId[1] = 0x01;
 
-        if (haveReceivedPokemon) {
-            memset(block, 0, sizeof(Gen2PartyBlock));
-            memset(block->preamble, SERIAL_PREAMBLE_BYTE, GEN2_PREAMBLE_SIZE);
-            memcpy(block->playerName, storedOT, NAME_LENGTH);
-            block->partyCount = PARTY_LENGTH;
-            block->playerId[0] = 0x00;
-            block->playerId[1] = 0x01;
-            for (int i = 0; i < PARTY_LENGTH; i++) {
-                block->partySpecies[i] = storedSpeciesIndex;
-                memcpy(&block->pokemon[i], storedMon, GEN2_PARTY_STRUCT_SIZE);
-                memcpy(block->otNames[i], storedOT, NAME_LENGTH);
-                memcpy(block->nicknames[i], storedNickname, NAME_LENGTH);
+        if (mode == TRADE_MODE_CLONE) {
+            if (party[0].occupied) {
+                memcpy(block->playerName, party[0].ot, NAME_LENGTH);
+                block->partyCount = PARTY_LENGTH;
+                for (int i = 0; i < PARTY_LENGTH; i++) {
+                    block->partySpecies[i] = party[0].speciesIndex;
+                    memcpy(&block->pokemon[i], party[0].monData, GEN2_PARTY_STRUCT_SIZE);
+                    memcpy(block->otNames[i], party[0].ot, NAME_LENGTH);
+                    memcpy(block->nicknames[i], party[0].nickname, NAME_LENGTH);
+                    partyToStorage[i] = 0;
+                }
+                block->partySpecies[PARTY_LENGTH] = 0xFF;
+            } else {
+                gen2_buildDefaultParty(block);
+                for (int i = 0; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
             }
-            block->partySpecies[PARTY_LENGTH] = 0xFF;
         } else {
-            gen2_buildDefaultParty(block);
+            int pos = 0;
+            for (int i = 0; i < PARTY_LENGTH && pos < PARTY_LENGTH; i++) {
+                if (party[i].occupied) {
+                    block->partySpecies[pos] = party[i].speciesIndex;
+                    memcpy(&block->pokemon[pos], party[i].monData, GEN2_PARTY_STRUCT_SIZE);
+                    memcpy(block->otNames[pos], party[i].ot, NAME_LENGTH);
+                    memcpy(block->nicknames[pos], party[i].nickname, NAME_LENGTH);
+                    partyToStorage[pos] = i;
+                    pos++;
+                }
+            }
+            if (pos == 0) {
+                gen2_buildDefaultParty(block);
+                for (int i = 0; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
+            } else {
+                memcpy(block->playerName, party[partyToStorage[0]].ot, NAME_LENGTH);
+                block->partyCount = pos;
+                block->partySpecies[pos] = 0xFF;
+                for (int i = pos; i < PARTY_LENGTH; i++) partyToStorage[i] = -1;
+            }
         }
 
         buildPatchList(sendBlock + GEN2_PREAMBLE_SIZE, dataLength,
                        sendPatch, PATCH_DATA_SPLIT);
     }
 
-    Serial.printf("[TRADE] Prepared %s party (%d data bytes, %s)\n",
+    Serial.printf("[TRADE] Prepared %s party (%d data bytes, mode=%s)\n",
                   gen == GEN_1 ? "Gen1" : "Gen2",
                   dataLength,
-                  haveReceivedPokemon ? "clone" : "default");
+                  (TradeMode)ctx.tradeMode == TRADE_MODE_CLONE ? "clone" : "storage");
 }
 
 // =============================================================================
-// Save Received Pokemon
+// Save Received Pokemon to NVS
 // =============================================================================
 
 static void saveReceivedPokemon() {
@@ -170,80 +216,90 @@ static void saveReceivedPokemon() {
     // Apply patch list to restore 0xFE bytes in received data
     applyPatchList(recvBlock, dataLength, recvPatch);
 
+    StoredPokemon received;
+    memset(&received, 0, sizeof(received));
+    received.occupied = true;
+
     int monSize, monOffset, otOffset, nickOffset;
 
     if (gen == GEN_1) {
-        // Layout within data portion (after preamble, which we didn't store):
-        // [0..10] playerName (11)
-        // [11] partyCount (1)
-        // [12..18] partySpecies (7)
-        // [19..282] pokemon[6] (44*6=264)
-        // [283..348] otNames[6] (11*6=66)
-        // [349..414] nicknames[6] (11*6=66)
-        // [415..417] padding (3)
         monSize = GEN1_PARTY_STRUCT_SIZE;
         monOffset = 19 + (tradePokemon * monSize);
         otOffset = 283 + (tradePokemon * NAME_LENGTH);
         nickOffset = 349 + (tradePokemon * NAME_LENGTH);
-        storedSpeciesIndex = recvBlock[12 + tradePokemon]; // partySpecies[i] starts at offset 12
+        received.speciesIndex = recvBlock[12 + tradePokemon];
 
-        memcpy(storedMon, recvBlock + monOffset, monSize);
-        memcpy(storedOT, recvBlock + otOffset, NAME_LENGTH);
-        memcpy(storedNickname, recvBlock + nickOffset, NAME_LENGTH);
+        memcpy(received.monData, recvBlock + monOffset, monSize);
+        memcpy(received.ot, recvBlock + otOffset, NAME_LENGTH);
+        memcpy(received.nickname, recvBlock + nickOffset, NAME_LENGTH);
 
-        // Log what we received
         Gen1PartyMon* mon = (Gen1PartyMon*)(recvBlock + monOffset);
         Serial.printf("[TRADE] Received Gen1 Pokemon: %s (idx=0x%02X) Lv%d\n",
                       gen1_getSpeciesName(mon->species), mon->species, mon->level);
-
     } else {
-        // Gen 2 layout within data portion:
-        // [0..10] playerName (11)
-        // [11] partyCount (1)
-        // [12..18] partySpecies (7)
-        // [19..20] playerId (2)
-        // [21..308] pokemon[6] (48*6=288)
-        // [309..374] otNames[6] (11*6=66)
-        // [375..440] nicknames[6] (11*6=66)
-        // [441..443] padding (3)
         monSize = GEN2_PARTY_STRUCT_SIZE;
         monOffset = 21 + (tradePokemon * monSize);
         otOffset = 309 + (tradePokemon * NAME_LENGTH);
         nickOffset = 375 + (tradePokemon * NAME_LENGTH);
-        storedSpeciesIndex = recvBlock[12 + tradePokemon];
+        received.speciesIndex = recvBlock[12 + tradePokemon];
 
-        memcpy(storedMon, recvBlock + monOffset, monSize);
-        memcpy(storedOT, recvBlock + otOffset, NAME_LENGTH);
-        memcpy(storedNickname, recvBlock + nickOffset, NAME_LENGTH);
+        memcpy(received.monData, recvBlock + monOffset, monSize);
+        memcpy(received.ot, recvBlock + otOffset, NAME_LENGTH);
+        memcpy(received.nickname, recvBlock + nickOffset, NAME_LENGTH);
 
         Gen2PartyMon* mon = (Gen2PartyMon*)(recvBlock + monOffset);
         Serial.printf("[TRADE] Received Gen2 Pokemon: %s (dex=%d) Lv%d\n",
                       gen2_getSpeciesName(mon->species), mon->species, mon->level);
     }
 
-    haveReceivedPokemon = true;
+    // Determine save slot
+    TradeMode mode = (TradeMode)ctx.tradeMode;
+    int saveSlot;
+
+    if (mode == TRADE_MODE_CLONE) {
+        saveSlot = 0;
+    } else {
+        // Storage mode: save to the storage slot that was traded away
+        int offerPos = ctx.offerSlot;
+        saveSlot = (offerPos >= 0 && offerPos < PARTY_LENGTH && partyToStorage[offerPos] >= 0)
+                   ? partyToStorage[offerPos] : 0;
+    }
+
+    storage_saveSlot(gen, saveSlot, &received);
     tradePokemon = -1;
 }
 
 // =============================================================================
-// Log Received Party Summary
+// Log Received Party Summary + populate TradeContext opponent info
 // =============================================================================
 
 static void logReceivedParty() {
     int count = recvBlock[11]; // partyCount at offset 11 in data portion
     if (count > PARTY_LENGTH) count = PARTY_LENGTH;
 
+    ctx.opponentCount = count;
+
     Serial.printf("[TRADE] Opponent party (%d Pokemon):\n", count);
 
     for (int i = 0; i < count; i++) {
         if (gen == GEN_1) {
-            Gen1PartyMon* mon = (Gen1PartyMon*)(recvBlock + 19 + i * GEN1_PARTY_STRUCT_SIZE);
+            int monOff = 19 + i * GEN1_PARTY_STRUCT_SIZE;
+            int nickOff = 349 + i * NAME_LENGTH;
+            Gen1PartyMon* mon = (Gen1PartyMon*)(recvBlock + monOff);
+            ctx.opponentSpecies[i] = mon->species;
+            ctx.opponentLevels[i] = mon->level;
+            memcpy((void*)ctx.opponentNicknames[i], recvBlock + nickOff, NAME_LENGTH);
             Serial.printf("  [%d] %s (idx=0x%02X) Lv%d HP=%d\n",
                           i, gen1_getSpeciesName(mon->species),
                           mon->species, mon->level,
                           (mon->hp[0] << 8) | mon->hp[1]);
         } else {
-            Gen2PartyMon* mon = (Gen2PartyMon*)(recvBlock + 21 + i * GEN2_PARTY_STRUCT_SIZE);
+            int monOff = 21 + i * GEN2_PARTY_STRUCT_SIZE;
+            int nickOff = 375 + i * NAME_LENGTH;
+            Gen2PartyMon* mon = (Gen2PartyMon*)(recvBlock + monOff);
+            ctx.opponentSpecies[i] = mon->species;
+            ctx.opponentLevels[i] = mon->level;
+            memcpy((void*)ctx.opponentNicknames[i], recvBlock + nickOff, NAME_LENGTH);
             Serial.printf("  [%d] %s (dex=%d) Lv%d HP=%d\n",
                           i, gen2_getSpeciesName(mon->species),
                           mon->species, mon->level,
@@ -264,6 +320,12 @@ static void resetConnection() {
     counter = 0;
     dataLength = 0;
     outByte = 0x00;
+    ctx.opponentCount = 0;
+    ctx.tradePokemon = -1;
+    ctx.confirmRequested = false;
+    ctx.declineRequested = false;
+
+    syncContext();
 
     if (prev != CONN_NOT_CONNECTED) {
         Serial.printf("[CONN] Disconnected (was %s)\n", connStateName(prev));
@@ -302,23 +364,22 @@ static uint8_t handleByte(uint8_t in) {
             Serial.println("[CONN] Connected (Gen 2)");
             led_setPattern(LED_DOUBLE_BLINK);
         } else {
-            send = in; // Echo unknown bytes
+            send = in;
         }
         break;
 
     // =========================================================================
-    // CONNECTED: Menu navigation, waiting for Trade Centre / Colosseum selection
+    // CONNECTED: Menu navigation
     // =========================================================================
     case CONN_CONNECTED:
         if (in == ITEM_1_HIGHLIGHTED || in == ITEM_2_HIGHLIGHTED || in == ITEM_3_HIGHLIGHTED) {
-            // Menu highlight — if Gen 2 sent this, it's using Gen 1 protocol (Time Capsule)
             if (gen == GEN_2) {
                 gen = GEN_1;
                 Serial.println("[CONN] Gen 2 Time Capsule detected (switching to Gen 1 format)");
             }
             send = in;
         } else if (in == TRADE_CENTRE) {
-            if (gen == GEN_2) gen = GEN_1; // Time Capsule
+            if (gen == GEN_2) gen = GEN_1;
             connState = CONN_TRADE_CENTRE;
             tcState = TC_INIT;
             Serial.println("[CONN] -> TRADE_CENTRE");
@@ -331,9 +392,9 @@ static uint8_t handleByte(uint8_t in) {
             resetConnection();
             send = BREAK_LINK;
         } else if (in == PKMN_CONNECTED || in == PKMN_CONNECTED_GEN2) {
-            send = in; // Keep-alive echo
+            send = in;
         } else {
-            send = in; // Echo
+            send = in;
         }
         break;
 
@@ -364,9 +425,8 @@ static uint8_t handleByte(uint8_t in) {
 
         case TC_SEEN_FIRST_WAIT:
             if (in != SERIAL_PREAMBLE_BYTE) {
-                // First non-preamble byte = start of random data
                 tcState = TC_SENDING_RANDOM_DATA;
-                send = in; // Echo random data (slave's random is ignored)
+                send = in;
                 counter = 0;
             } else {
                 send = SERIAL_PREAMBLE_BYTE;
@@ -375,20 +435,17 @@ static uint8_t handleByte(uint8_t in) {
 
         case TC_SENDING_RANDOM_DATA:
             if (in == SERIAL_PREAMBLE_BYTE) {
-                // Preamble for data block
                 tcState = TC_WAITING_TO_SEND_DATA;
                 send = SERIAL_PREAMBLE_BYTE;
                 prepareTradeData();
             } else {
-                send = in; // Echo random data
+                send = in;
             }
             break;
 
         case TC_WAITING_TO_SEND_DATA:
             if (in != SERIAL_PREAMBLE_BYTE) {
-                // First data byte — start exchange
                 counter = 0;
-                // Send our first data byte (offset past preamble)
                 send = sendBlock[GEN1_PREAMBLE_SIZE + counter];
                 recvBlock[counter] = in;
                 counter++;
@@ -412,17 +469,13 @@ static uint8_t handleByte(uint8_t in) {
 
         case TC_SENDING_PATCH_DATA:
             if (in == SERIAL_PREAMBLE_BYTE) {
-                // Consume patch preamble bytes
                 counter = 0;
                 send = SERIAL_PREAMBLE_BYTE;
             } else {
-                // Exchange patch data (echo back — we don't need to send our own
-                // patch corrections since buildPatchList already patched our data)
-                send = sendPatch[3 + counter]; // Skip our 3-byte preamble
+                send = sendPatch[3 + counter];
                 recvPatch[3 + counter] = in;
                 counter++;
                 if (counter >= 197) {
-                    // Fill in preamble bytes we consumed
                     recvPatch[0] = SERIAL_PREAMBLE_BYTE;
                     recvPatch[1] = SERIAL_PREAMBLE_BYTE;
                     recvPatch[2] = SERIAL_PREAMBLE_BYTE;
@@ -435,15 +488,15 @@ static uint8_t handleByte(uint8_t in) {
         case TC_TRADE_PENDING:
             if ((in & 0x60) == 0x60) {
                 if (in == 0x6F) {
-                    // Cancel / back to menu
                     tcState = TC_READY_TO_GO;
                     send = 0x6F;
                     Serial.println("[TC] Trade cancelled -> READY_TO_GO");
                 } else {
-                    // Game Boy selected a Pokemon (0x60 + index)
+                    // Game Boy selected a Pokemon
                     tradePokemon = in - TRADE_POKEMON_BASE;
-                    send = TRADE_POKEMON_BASE; // We always offer Pokemon 0
-                    Serial.printf("[TC] GB selected Pokemon %d, we offer 0\n", tradePokemon);
+                    // Offer the slot selected via web UI
+                    send = TRADE_POKEMON_BASE + ctx.offerSlot;
+                    Serial.printf("[TC] GB selected %d, we offer %d\n", tradePokemon, ctx.offerSlot);
                 }
             } else if (in == 0x00) {
                 send = 0x00;
@@ -457,16 +510,30 @@ static uint8_t handleByte(uint8_t in) {
         case TC_TRADE_CONFIRMATION:
             if ((in & 0x60) == 0x60) {
                 if (in == 0x61) {
-                    // Trade declined
+                    // GB declined
                     tradePokemon = -1;
                     tcState = TC_TRADE_PENDING;
                     send = in;
-                    Serial.println("[TC] Trade declined -> TRADE_PENDING");
+                    Serial.println("[TC] Trade declined by GB -> TRADE_PENDING");
                 } else {
-                    // Trade confirmed (0x62)
-                    send = 0x62; // We always confirm
-                    tcState = TC_DONE;
-                    Serial.println("[TC] Trade confirmed! -> DONE");
+                    // GB confirmed (0x62) — check our response
+                    if (ctx.autoConfirm) {
+                        send = 0x62;
+                        tcState = TC_DONE;
+                        Serial.println("[TC] Trade auto-confirmed -> DONE");
+                    } else if (ctx.confirmRequested) {
+                        ctx.confirmRequested = false;
+                        send = 0x62;
+                        tcState = TC_DONE;
+                        Serial.println("[TC] Trade confirmed (manual) -> DONE");
+                    } else {
+                        // Decline — go back to pending
+                        send = 0x61;
+                        tradePokemon = -1;
+                        tcState = TC_TRADE_PENDING;
+                        ctx.declineRequested = false;
+                        Serial.println("[TC] Trade declined (manual) -> TRADE_PENDING");
+                    }
                 }
             } else {
                 send = in;
@@ -486,7 +553,7 @@ static uint8_t handleByte(uint8_t in) {
         break;
 
     // =========================================================================
-    // COLOSSEUM: Just echo (not implementing battle)
+    // COLOSSEUM: Just echo
     // =========================================================================
     case CONN_COLOSSEUM:
         if (in == BREAK_LINK || in == PKMN_MASTER) {
@@ -498,6 +565,7 @@ static uint8_t handleByte(uint8_t in) {
         break;
     }
 
+    syncContext();
     return send;
 }
 
@@ -507,9 +575,9 @@ static uint8_t handleByte(uint8_t in) {
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Wait for USB CDC serial
+    delay(1000);
 
-    Serial.println("=== PokeTool v0.1 ===");
+    Serial.println("=== PokeTool v0.2 ===");
     Serial.printf("Pins: MOSI=%d MISO=%d SCLK=%d LED=%d\n",
                   PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_LED);
 
@@ -517,26 +585,36 @@ void setup() {
     led_init();
     led_setPattern(LED_SLOW_BLINK);
 
+    // Initialize NVS storage
+    storage_init();
+
+    // Initialize trade context
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.tradeMode = (int)storage_getTradeMode();
+    ctx.offerSlot = 0;
+    ctx.autoConfirm = true;
+    ctx.tradePokemon = -1;
+
+    // Start WiFi AP + web server
+    wifi_init(&ctx);
+
     resetConnection();
 
-    Serial.println("Ready. Waiting for Game Boy...");
+    Serial.println("Ready. Connect to WiFi 'PokeTool' -> 192.168.4.1");
 }
 
 void loop() {
     led_update();
 
-    // Exchange a byte with the Game Boy
     int received = link_transferByte(outByte);
 
     if (received < 0) {
-        // Timeout — check if we should do idle bookkeeping
         if (link_isIdle(IDLE_TIMEOUT_MS)) {
             // Save received Pokemon if a trade was completed
             if (tradePokemon >= 0 && tcState < TC_TRADE_PENDING) {
                 saveReceivedPokemon();
             }
 
-            // Reset if we were connected
             if (connState != CONN_NOT_CONNECTED) {
                 resetConnection();
             }
@@ -544,7 +622,6 @@ void loop() {
         return;
     }
 
-    // Process the received byte and get our next send byte
     outByte = handleByte((uint8_t)received);
 
     delayMicroseconds(BYTE_DELAY_US);
