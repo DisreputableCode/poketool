@@ -1,1 +1,5 @@
 reference/
+CLAUDE.md
+.beads/
+.pio/
+.DS_Store
