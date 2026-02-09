@@ -2,6 +2,7 @@
 #define WIFI_SERVER_H
 
 #include "config.h"
+#include <stdarg.h>
 
 // Forward declarations for enums used by TradeContext
 // (ConnectionState and TradeCentreState are defined in main.cpp)
@@ -35,5 +36,18 @@ struct TradeContext {
 
 // Start WiFi AP and web server. Must be called after storage_init().
 void wifi_init(TradeContext* ctx);
+
+// =============================================================================
+// Debug logging — streams to SSE /events endpoint
+// =============================================================================
+
+// Printf-style log: writes to Serial AND sends to SSE "log" event
+void debug_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// Record an SPI byte exchange (batched, low overhead in hot path)
+void debug_spi(uint8_t sent, uint8_t recv);
+
+// Flush any pending SPI data to SSE (call during idle)
+void debug_spi_flush();
 
 #endif // WIFI_SERVER_H

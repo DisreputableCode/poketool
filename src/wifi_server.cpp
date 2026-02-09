@@ -4,12 +4,14 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
+#include <stdarg.h>
 
 // =============================================================================
 // WiFi + Web Server Implementation
 // =============================================================================
 
 static AsyncWebServer server(80);
+static AsyncEventSource events("/events");
 static TradeContext* ctx = nullptr;
 
 // Connection state names (must match enum order in main.cpp)
@@ -55,6 +57,57 @@ static void gbTextToAscii(const uint8_t* src, char* dst, int maxLen) {
 }
 
 // =============================================================================
+// Debug Logging
+// =============================================================================
+
+void debug_logf(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    Serial.print(buf);
+    events.send(buf, "log", millis());
+}
+
+// SPI batch buffer — raw bytes, formatted on flush
+#define SPI_BATCH_MAX 256
+static uint8_t spiBatchSend[SPI_BATCH_MAX];
+static uint8_t spiBatchRecv[SPI_BATCH_MAX];
+static int spiBatchLen = 0;
+
+static const char HEX_CHARS[] = "0123456789ABCDEF";
+
+void debug_spi(uint8_t sent, uint8_t recv) {
+    if (spiBatchLen < SPI_BATCH_MAX) {
+        spiBatchSend[spiBatchLen] = sent;
+        spiBatchRecv[spiBatchLen] = recv;
+        spiBatchLen++;
+    }
+    if (spiBatchLen >= SPI_BATCH_MAX) debug_spi_flush();
+}
+
+void debug_spi_flush() {
+    if (spiBatchLen == 0) return;
+    int len = spiBatchLen;
+    spiBatchLen = 0;
+
+    // Format: "XX:YY\n" per pair (6 chars each)
+    static char buf[SPI_BATCH_MAX * 6 + 1];
+    int pos = 0;
+    for (int i = 0; i < len; i++) {
+        buf[pos++] = HEX_CHARS[spiBatchSend[i] >> 4];
+        buf[pos++] = HEX_CHARS[spiBatchSend[i] & 0xF];
+        buf[pos++] = ':';
+        buf[pos++] = HEX_CHARS[spiBatchRecv[i] >> 4];
+        buf[pos++] = HEX_CHARS[spiBatchRecv[i] & 0xF];
+        buf[pos++] = '\n';
+    }
+    buf[pos] = '\0';
+    events.send(buf, "spi", millis());
+}
+
+// =============================================================================
 // REST API Handlers
 // =============================================================================
 
@@ -77,7 +130,6 @@ static void handleStatus(AsyncWebServerRequest* request) {
 
 static void handleSetMode(AsyncWebServerRequest* request, uint8_t* data, size_t len,
                            size_t index, size_t total) {
-    // Parse {"mode":"clone"} or {"mode":"storage"}
     String body = String((char*)data, len);
     TradeMode newMode;
     if (body.indexOf("\"storage\"") >= 0) {
@@ -95,7 +147,6 @@ static void handleGetPokemon(AsyncWebServerRequest* request) {
     Generation g = (genParam == "gen1" || genParam == "1") ? GEN_1 : GEN_2;
     StoredPokemon* party = storage_getParty(g);
 
-    // Build JSON array
     String json = "[";
     for (int i = 0; i < PARTY_LENGTH; i++) {
         if (i > 0) json += ",";
@@ -111,7 +162,6 @@ static void handleGetPokemon(AsyncWebServerRequest* request) {
             json += speciesName(g, party[i].speciesIndex);
             json += "\"";
 
-            // Extract level from mon data
             int level = 0;
             if (g == GEN_1) {
                 Gen1PartyMon* mon = (Gen1PartyMon*)party[i].monData;
@@ -123,7 +173,6 @@ static void handleGetPokemon(AsyncWebServerRequest* request) {
             json += ",\"level\":";
             json += level;
 
-            // Nickname
             char nick[NAME_LENGTH + 1];
             gbTextToAscii(party[i].nickname, nick, NAME_LENGTH);
             json += ",\"nickname\":\"";
@@ -153,7 +202,6 @@ static void handleDeletePokemon(AsyncWebServerRequest* request) {
 
 static void handleTradeOffer(AsyncWebServerRequest* request, uint8_t* data, size_t len,
                               size_t index, size_t total) {
-    // Parse {"slot":N}
     String body = String((char*)data, len);
     int idx = body.indexOf("\"slot\":");
     if (idx >= 0) {
@@ -201,7 +249,6 @@ static void handleGetOpponent(AsyncWebServerRequest* request) {
         json += "\",\"level\":";
         json += ctx->opponentLevels[i];
 
-        // Nickname
         char nick[NAME_LENGTH + 1];
         gbTextToAscii((const uint8_t*)ctx->opponentNicknames[i], nick, NAME_LENGTH);
         json += ",\"nickname\":\"";
@@ -232,23 +279,27 @@ void wifi_init(TradeContext* tradeCtx) {
     IPAddress ip = WiFi.softAPIP();
     Serial.printf("[WIFI] AP started: SSID=%s IP=%s\n", WIFI_SSID, ip.toString().c_str());
 
-    // Serve static files from LittleFS
-    server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+    // SSE event source for debug page
+    events.onConnect([](AsyncEventSourceClient* client) {
+        client->send("connected", "log", millis());
+    });
+    server.addHandler(&events);
 
-    // REST API routes
+    // REST API routes (must be registered before serveStatic catch-all)
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/opponent", HTTP_GET, handleGetOpponent);
 
-    // Pokemon storage routes with path params
     server.on("^\\/api\\/pokemon\\/([a-z0-9]+)$", HTTP_GET, handleGetPokemon);
     server.on("^\\/api\\/pokemon\\/([a-z0-9]+)\\/([0-9]+)$", HTTP_DELETE, handleDeletePokemon);
 
-    // POST routes need body handlers
     server.on("/api/mode", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleSetMode);
     server.on("/api/trade/offer", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleTradeOffer);
     server.on("/api/trade/confirm", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleTradeConfirm);
     server.on("/api/trade/decline", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleTradeDecline);
     server.on("/api/trade/auto", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleTradeAuto);
+
+    // Static files last (catch-all)
+    server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
     server.begin();
     Serial.println("[WIFI] Web server started on port 80");

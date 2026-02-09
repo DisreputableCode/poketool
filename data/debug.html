@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PokeTool Debug</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: monospace; background: #0a0a1a; color: #e0e0e0; min-height: 100vh; padding: 8px; font-size: 13px; }
+.header { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: #16213e; border-radius: 6px; margin-bottom: 8px; }
+.header h1 { font-size: 1.2em; }
+.header a { color: #e76f51; text-decoration: none; font-size: 0.9em; }
+.panel { background: #111; border: 1px solid #333; border-radius: 6px; margin-bottom: 8px; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #1a1a2e; border-radius: 6px 6px 0 0; border-bottom: 1px solid #333; }
+.panel-head h2 { font-size: 0.95em; font-weight: normal; }
+.panel-head span { font-size: 0.8em; color: #666; }
+.panel-head button { background: #333; color: #aaa; border: none; border-radius: 3px; padding: 2px 8px; cursor: pointer; font-size: 0.8em; }
+.log-area { height: 38vh; overflow-y: auto; padding: 6px; white-space: pre-wrap; word-wrap: break-word; color: #4f4; line-height: 1.4; }
+.spi-area { height: 38vh; overflow-y: auto; padding: 6px; white-space: pre-wrap; word-wrap: break-word; color: #4ff; line-height: 1.4; font-size: 12px; }
+.sse-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.sse-off { background: #c0392b; }
+.sse-on { background: #27ae60; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>PokeTool Debug</h1>
+  <div>
+    <span class="sse-dot sse-off" id="sseDot"></span>
+    <span id="sseLabel">Connecting...</span>
+    &nbsp;|&nbsp;
+    <a href="/">Dashboard</a>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Serial Console</h2>
+    <div>
+      <span id="logCount">0 lines</span>
+      <button onclick="clearEl('log')">Clear</button>
+    </div>
+  </div>
+  <div id="log" class="log-area"></div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>SPI Data (TX:RX)</h2>
+    <div>
+      <span id="spiCount">0 bytes</span>
+      <button onclick="clearEl('spi')">Clear</button>
+    </div>
+  </div>
+  <div id="spi" class="spi-area"></div>
+</div>
+
+<script>
+const MAX_CHARS = 100000;
+let logLines = 0;
+let spiBytes = 0;
+
+function appendText(el, text) {
+  el.textContent += text;
+  if (el.textContent.length > MAX_CHARS) {
+    el.textContent = el.textContent.substring(el.textContent.length - MAX_CHARS);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearEl(id) {
+  document.getElementById(id).textContent = '';
+  if (id === 'log') { logLines = 0; document.getElementById('logCount').textContent = '0 lines'; }
+  if (id === 'spi') { spiBytes = 0; document.getElementById('spiCount').textContent = '0 bytes'; }
+}
+
+const es = new EventSource('/events');
+
+es.addEventListener('log', function(e) {
+  const el = document.getElementById('log');
+  appendText(el, e.data);
+  logLines += (e.data.match(/\n/g) || []).length;
+  document.getElementById('logCount').textContent = logLines + ' lines';
+});
+
+es.addEventListener('spi', function(e) {
+  const el = document.getElementById('spi');
+  const lines = e.data.trim().split('\n');
+  let out = '';
+  let count = 0;
+  for (const line of lines) {
+    if (!line) continue;
+    out += line + ' ';
+    count++;
+    if (count % 16 === 0) out += '\n';
+  }
+  appendText(el, out);
+  spiBytes += count;
+  document.getElementById('spiCount').textContent = spiBytes + ' bytes';
+});
+
+es.onopen = function() {
+  document.getElementById('sseDot').className = 'sse-dot sse-on';
+  document.getElementById('sseLabel').textContent = 'Live';
+};
+
+es.onerror = function() {
+  document.getElementById('sseDot').className = 'sse-dot sse-off';
+  document.getElementById('sseLabel').textContent = 'Reconnecting...';
+};
+</script>
+</body>
+</html>
